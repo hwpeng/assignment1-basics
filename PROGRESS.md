@@ -7,7 +7,7 @@ Personal study notes and implementation progress. Based on the [Stanford CS336 a
 - [x] Watch Lecture 2.
 - [x] Implement BPE training and pass the three supplied BPE training tests.
 - [x] Compare four merge strategies on the 5 MiB TinyStories sample.
-- [x] Train BPE on the full TinyStories training dataset, save the vocabulary and merges, and compare single-process and eight-process pre-tokenization.
+- [x] Train BPE on the full TinyStories training dataset, save the vocabulary and merges, and compare single-process, eight-process, and sixteen-process pre-tokenization.
 - [x] Profile the final parallel training run and record the bottleneck.
 - [ ] Section 2.6: implement and test encoding and decoding (next).
 - [ ] OpenWebText BPE experiment (deferred for now).
@@ -20,18 +20,20 @@ Training uses the 2,227,753,162-byte TinyStories training file, a maximum vocabu
 | --- | ---: | --- |
 | Heap merges, single-process pre-tokenization | 120.35 s | 3,834 MiB, whole process |
 | Heap merges, eight-process pre-tokenization | 29.03 s | 213.6 MiB, parent only; workers excluded |
+| Heap merges, sixteen-process pre-tokenization | 25.10 s | 217.6 MiB, parent only; workers excluded |
 
-The two full runs produced identical vocabularies and ordered merges. The longest token was `b' accomplishment'` (15 bytes); a word with a leading space is plausible given the pre-tokenization pattern. The memory numbers are not directly comparable. These are single runs on one machine.
+All three full runs produced identical vocabularies and ordered merges. The longest token was `b' accomplishment'` (15 bytes); a word with a leading space is plausible given the pre-tokenization pattern. The memory numbers are not directly comparable. These are single runs on one machine with 10 reported logical CPUs; 16 processes share those CPUs.
 
 The saved outputs are `data/tinystories_bpe_heap.json` and `data/tinystories_bpe_heap_parallel.json`. Their byte values are encoded as hexadecimal strings. To rerun the parallel experiment, from the repository root:
 
 ```sh
-uv run python -m tests.run_parallel_bpe
+uv run python -m tests.run_parallel_bpe     # eight processes
+uv run python -m tests.run_parallel_bpe 16  # sixteen processes
 ```
 
 ## Profiling the parallel trainer
 
-In a separate full-data run with `cProfile` enabled for the parent and all eight workers, the full run took 47.99 s and the parallel pre-tokenization stage took 45.22 s wall time, including process setup, file reading, counting, and result collection. Profiling adds overhead, so these times should not be compared directly with the unprofiled 29.03 s run. Worker profiles showed that pre-token matching and counting dominated their work. Summed worker times overlap in parallel and are not wall time. Thus, even after parallelization, pre-tokenization remains the largest measured stage in this profile.
+In a separate full-data run with `cProfile` enabled for the parent and all eight workers, the full run took 47.99 s and the parallel pre-tokenization stage took 45.22 s wall time, including process setup, file reading, counting, and result collection. Profiling adds overhead, so these times should not be compared directly with the unprofiled 29.03 s run. Worker profiles showed that pre-token matching and counting dominated their work. Summed worker times overlap in parallel and are not wall time. Thus, even after parallelization, pre-tokenization remains the largest measured stage in this profile. Every occurrence in the input must be read and counted, while the merge stage works on distinct pre-tokens and their frequencies; repeated pre-tokens are represented once.
 
 Reproduce with `uv run python -m tests.profile_parallel_bpe`. The script writes the raw profiles to `/tmp`.
 

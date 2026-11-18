@@ -164,3 +164,4 @@ cython_debug/
 # Local training datasets (large downloads)
 /data/*.txt
 /data/*.gz
+/data/tinystories_bpe_heap_parallel_16.json
