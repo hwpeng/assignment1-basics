@@ -8,6 +8,7 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+import regex as re
 
 
 def run_linear(
@@ -568,25 +569,213 @@ def run_train_bpe(
     special_tokens: list[str],
     **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """Given the path to an input corpus, run train a BPE tokenizer and
-    output its vocabulary and merges.
+    """Train a byte-level BPE vocabulary and an ordered list of merges.
 
     Args:
-        input_path (str | os.PathLike): Path to BPE tokenizer training data.
-        vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
-        special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
-            These strings will never be split into multiple tokens, and will always be
-            kept as a single token. If these special tokens occur in the `input_path`,
-            they are treated as any other string.
+        input_path: Path to the UTF-8 training text file.
+        vocab_size: Maximum total vocabulary size, including the initial 256
+            byte tokens, special tokens, and tokens learned through merging.
+        special_tokens: Strings given dedicated token IDs. During training,
+            their occurrences define hard boundaries and do not contribute
+            to pre-token or merge statistics.
 
     Returns:
-        tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-            vocab:
-                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
-                to bytes (token bytes)
-            merges:
-                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
-                representing that <token1> was merged with <token2>.
-                Merges are ordered by order of creation.
+        vocab: Mapping from integer token IDs to their byte contents.
+        merge: Pairs of byte tokens, in the order their merges were learned.
     """
-    raise NotImplementedError
+    # The assignment's regex defines pre-token boundaries. These pieces are
+    # word-like, but can also contain numbers, punctuation, or whitespace.
+    # BPE merges are restricted to the inside of each pre-token.
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    vocab = {}
+    merge = []
+
+    # One byte has 256 possible values (0–255), regardless of character frequency.
+    # bytes([i]) creates ONE byte with value i; bytes(i) creates i zero bytes.
+    # Matching the token ID to the byte value is just a convenient assignment.
+    for i in range(256):
+        vocab[i] = bytes([i])
+
+    # A special token gets one ID for its entire UTF-8 byte sequence.
+    # This assigns its ID; recognizing it during encoding is a separate task.
+    for token in special_tokens:
+        idx = len(vocab)
+        vocab[idx] = token.encode("utf-8")
+
+    # The optional parallel path currently targets TinyStories' one marker.
+    # The original single-process implementation remains the default.
+    num_processes = kwargs.get("num_processes", 1)
+    if num_processes < 1:
+        raise ValueError("num_processes must be at least 1")
+    if num_processes > 1:
+        if special_tokens != ["<|endoftext|>"]:
+            raise ValueError("Parallel pre-tokenization requires the TinyStories marker")
+        from tests.bpe_parallel import parallel_pre_token_counts
+
+        pre_tokens_count = parallel_pre_token_counts(input_path, num_processes)
+    else:
+        # Decode the file's UTF-8 bytes into a Python string, preserving whitespace.
+        # This baseline reads the whole file; chunking can be considered later.
+        with open(input_path, "r", encoding="utf-8") as f:
+            text = f.read()
+
+        # Escape each marker so regex metacharacters inside it are matched literally.
+        # Joining with "|" means "match any of these markers."
+        # re.split removes the markers and keeps the surrounding segments separate.
+        # With no special tokens, the whole text is a single segment.
+        pattern = "|".join(re.escape(token) for token in special_tokens)
+        segments = re.split(pattern, text) if special_tokens else [text]
+
+        # Count exact pre-token strings across ALL segments, including leading spaces.
+        # finditer supplies matches one at a time; group() extracts the matched text.
+        # Repeated pre-tokens are stored once with a count to reduce work in training.
+        pre_tokens_count = {}
+        for segment in segments:
+            for match in re.finditer(PAT, segment):
+                pre_token = match.group()
+                if pre_token in pre_tokens_count:
+                    pre_tokens_count[pre_token] += 1
+                else:
+                    pre_tokens_count[pre_token] = 1
+
+    # Convert each pre-token into a tuple of single-byte tokens, keeping its count.
+    # UTF-8 uses 1–4 bytes per character; a byte need not be a whole character.
+    # Iterating over bytes yields integers, so bytes([value]) wraps each as bytes.
+    # Tuples can be dictionary keys; lists cannot.
+    # Example: "abab": 3 becomes (b"a", b"b", b"a", b"b"): 3.
+    # Later, the same structure can hold multi-byte tokens such as b"ab".
+    bytes_count = {}
+    for pre_token in pre_tokens_count:
+        tokens = []
+        for value in pre_token.encode("utf-8"):
+            tokens.append(bytes([value]))
+        bytes_count[tuple(tokens)] = pre_tokens_count[pre_token]
+
+    def find_best_pair(token_counts):
+        """Return the most frequent adjacent token pair and its weighted count."""
+        pair_counts = {}
+
+        # Statistics are global, but pairs never cross pre-token boundaries.
+        # Each occurrence contributes the frequency of its containing pre-token.
+        # Example: "abab" occurring 3 times contributes 6 to (a, b) and 3 to (b, a).
+        # Candidate pairs may overlap; replacement below consumes each position once.
+        for tokens, count in token_counts.items():
+            for i in range(len(tokens) - 1):
+                pair = (tokens[i], tokens[i + 1])
+                pair_counts[pair] = pair_counts.get(pair, 0) + count
+
+        # If every sequence has fewer than two tokens, nothing remains to merge.
+        if not pair_counts:
+            return None, 0
+
+        # Compare frequency first, then the pair itself. This picks the
+        # lexicographically greater pair when frequencies tie.
+        best_pair = max(
+            pair_counts,
+            key=lambda pair: (pair_counts[pair], pair),
+        )
+
+        return best_pair, pair_counts[best_pair]
+
+    def merge_pair(token_counts, best_pair):
+        """Replace non-overlapping occurrences of the selected pair left to right."""
+        new_counts = {}
+
+        for tokens, count in token_counts.items():
+            merged_tokens = []
+            i = 0
+
+            while i < len(tokens):
+                if i + 1 < len(tokens) and (tokens[i], tokens[i + 1]) == best_pair:
+                    # Concatenate bytes, then skip both consumed tokens.
+                    # For (a, a, a), merging (a, a) produces (aa, a).
+                    merged_tokens.append(tokens[i] + tokens[i + 1])
+                    i += 2
+                else:
+                    merged_tokens.append(tokens[i])
+                    i += 1
+
+            # The sequence's occurrence count is unchanged by the merge.
+            # Accumulate counts if updated sequences share the same key.
+            new_tokens = tuple(merged_tokens)
+            new_counts[new_tokens] = new_counts.get(new_tokens, 0) + count
+
+        return new_counts
+
+    def find_and_merge_with_index(token_counts):
+        pair_counts = {}
+        pair_to_seq = {}
+
+        for tokens, count in token_counts.items():
+            for i in range(len(tokens) - 1):
+                pair = (tokens[i], tokens[i + 1])
+                pair_counts[pair] = pair_counts.get(pair, 0) + count
+
+                if pair not in pair_to_seq:
+                    pair_to_seq[pair] = set()
+                pair_to_seq[pair].add(tokens)
+
+
+        if not pair_counts:
+            return token_counts.copy(), None, 0
+
+        best_pair = max(
+            pair_counts,
+            key=lambda pair: (pair_counts[pair], pair),
+        )
+
+        merged_token = best_pair[0] + best_pair[1]
+
+        new_counts = token_counts.copy()
+        updates = []
+
+        for tokens in pair_to_seq[best_pair]: 
+            merged_tokens = []
+            i = 0
+
+            while i < len(tokens):
+                if i + 1 < len(tokens) and (tokens[i], tokens[i + 1]) == best_pair:
+                    merged_tokens.append(merged_token)
+                    i += 2
+                else:
+                    merged_tokens.append(tokens[i])
+                    i += 1
+
+            new_counts.pop(tokens)
+            updates.append((tuple(merged_tokens), token_counts[tokens]))
+
+        for tokens, count in updates:
+            new_counts[tokens] = new_counts.get(tokens, 0) + count
+
+        return new_counts, best_pair, pair_counts[best_pair]
+
+
+
+    # Select a strategy without changing the assignment's default interface.
+    # "baseline" and "rebuild_index" preserve the original implementations.
+    strategy = kwargs.get("strategy", "rebuild_index")
+    if strategy not in {"baseline", "rebuild_index", "incremental", "heap"}:
+        raise ValueError(f"Unknown BPE strategy: {strategy}")
+    if strategy in {"incremental", "heap"}:
+        from tests.bpe_strategies import incremental_merges
+
+        incremental = incremental_merges(bytes_count, use_heap=(strategy == "heap"))
+
+    while len(vocab) < vocab_size:
+        if strategy == "baseline":
+            best_pair, _ = find_best_pair(bytes_count)
+            if best_pair is not None:
+                bytes_count = merge_pair(bytes_count, best_pair)
+        elif strategy == "rebuild_index":
+            bytes_count, best_pair, _ = find_and_merge_with_index(bytes_count)
+        else:
+            best_pair = next(incremental, None)
+
+        # Stop early if there are no adjacent pairs left.
+        if best_pair is None:
+            break
+        vocab[len(vocab)] = best_pair[0] + best_pair[1]
+        merge.append(best_pair)
+
+    return vocab, merge

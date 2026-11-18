@@ -1,5 +1,7 @@
 # CS336 Spring 2025 Assignment 1: Basics
 
+**Personal study progress:** see [PROGRESS.md](PROGRESS.md) for completed work, measurements, and next steps.
+
 For a full description of the assignment, see the assignment handout at
 [cs336_assignment1_basics.pdf](./cs336_assignment1_basics.pdf)
 
