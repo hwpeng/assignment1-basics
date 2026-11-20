@@ -1,6 +1,6 @@
 # CS336 Assignment 1: Progress
 
-Personal study notes and implementation progress. Based on the [Stanford CS336 assignment1-basics repository](https://github.com/stanford-cs336/assignment1-basics). See the original [README](README.md) and [handout](cs336_assignment1_basics.pdf) for setup and requirements.
+Personal study notes and implementation progress. For the full learning review and step-by-step optimization history, see [BPE_REVIEW.md](BPE_REVIEW.md). Based on the [Stanford CS336 assignment1-basics repository](https://github.com/stanford-cs336/assignment1-basics). See the original [README](README.md) and [handout](cs336_assignment1_basics.pdf) for setup and requirements.
 
 ## Progress
 
@@ -9,7 +9,10 @@ Personal study notes and implementation progress. Based on the [Stanford CS336 a
 - [x] Compare four merge strategies on the 5 MiB TinyStories sample.
 - [x] Train BPE on the full TinyStories training dataset, save the vocabulary and merges, and compare single-process, eight-process, and sixteen-process pre-tokenization.
 - [x] Profile the final parallel training run and record the bottleneck.
-- [ ] Section 2.6: implement and test encoding and decoding (next).
+- [x] Section 2.6: implement encoding, decoding, and iterable encoding; 23 provided functional tests passed. Two memory tests skipped on macOS; arbitrary streaming boundaries remain unverified.
+- [x] Section 2.7: run small TinyStories-tokenizer compression experiments on both samples and measure throughput.
+- [ ] Encode training and validation data into `uint16` arrays for later model training.
+- [ ] Finish the relevant lecture, then start Section 3.
 - [ ] OpenWebText BPE experiment (deferred for now).
 
 ## TinyStories experiment
@@ -58,3 +61,19 @@ All four produced identical vocabularies and merges. These are single unprofiled
 - `tests/profile_parallel_bpe.py`: profiles the parent and worker processes.
 
 Run the existing checks with `uv run pytest tests/test_train_bpe.py -q`. The parallel pre-token counts, vocabulary and merges were also checked against the single-process output on the sample and on the full training file.
+
+## Encoding experiments and optimizations
+
+The corrected TinyStories tokenizer produced 4.10 bytes/token on 10 TinyStories documents (separately encoded, 7,844 bytes / 1,912 IDs) and 3.28 bytes/token on the first 10 OpenWebText documents (48,275 bytes / 14,707 IDs). This is a small sample, not a representative dataset-wide comparison. Our initial encoder ignored merge priority; its old compression measurements should not be used.
+
+| Encoder change | Workload | Result |
+| --- | --- | --- |
+| Scan all merge rules in priority order | 10 OpenWebText docs repeated 24 times | ~43,800 bytes/s average over 3 runs |
+| Look up adjacent-pair priorities | Same workload | ~1,276,000 bytes/s average over 3 runs; same ID count |
+| Cache pre-token merge results | Continuous ~20 MB TinyStories | 14.44 s → 2.87 s; process peaks 1,039.7 → 680.5 MiB, single runs |
+| Parallel pre-tokenization with cache | Same ~20 MB TinyStories | 1 process 6.86 MB/s; 8 processes 11.51 MB/s; 16 processes 11.96 MB/s, identical output hashes |
+
+Memory readings for the cache experiment are whole-process peaks, and worker memory for the parallel encoder was not measured. See [BPE_REVIEW.md](BPE_REVIEW.md) for the reasoning, profiles, caveats, and the full trainer optimization history.
+
+- `cs336_basics/tokenizer.py`: encoder, decoder, iterable interface, caching, and optional parallel pre-tokenization.
+- Run `uv run pytest tests/test_tokenizer.py -q` for the supplied tokenizer tests.
